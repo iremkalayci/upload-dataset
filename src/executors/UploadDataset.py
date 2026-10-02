@@ -84,7 +84,7 @@ class UploadDataset(Component):
     def bootstrap(config: dict) -> dict:
         return {}
 
-    def run(self):
+   def run(self):
         try:
             state = FrameState(self.redis_db.r, self.flowUID, self.matchedID)
 
@@ -92,6 +92,11 @@ class UploadDataset(Component):
             if not state.should_select(self.frame_interval):
                 self.upload_status = "skipped_frame"
                 return build_response(context=self)
+
+            # Gelen dict'in yapısını loga dök
+            if isinstance(self.input_image, dict):
+                logger.error("DEBUG INPUT_IMAGE KEYS: %s", list(self.input_image.keys()))
+                logger.error("DEBUG INPUT_IMAGE DATA: %s", str(self.input_image)[:300])
 
             dataset_id = parse_dataset_id(self.dataset)
             image_bytes = extract_raw_bytes(self.input_image)
@@ -106,11 +111,11 @@ class UploadDataset(Component):
             )
 
             # Kullanıcı batch adı girmemişse API'nin ürettiği ilk batch adını Redis'e yaz
-            api_batch = res.get("batch_name")[cite: 1]
+            api_batch = res.get("batch_name")
             if not self.batch_name_config and api_batch:
                 state.set_batch(dataset_id, api_batch)
 
-            self.upload_status = "duplicate" if res.get("skipped") else "uploaded"[cite: 1]
+            self.upload_status = "duplicate" if res.get("skipped") else "uploaded"
 
         except ApiClientError as e:
             self.upload_status = "error"
