@@ -171,7 +171,8 @@ def upload_image(
 
     # --- HTTP durum kodları ---
     sc = resp.status_code
-
+    print(sc)
+    print(resp.content)
     if sc == 401:
         raise ApiError("Kimlik doğrulama hatası (HTTP 401).")
     if sc == 403:
