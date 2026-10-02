@@ -1,4 +1,3 @@
-
 """NovaVision Data API: POST /data/image/upload"""
 
 import json
@@ -13,6 +12,10 @@ PROD_BASE_URL = "https://suite.novavision.ai/api"
 UPLOAD_PATH = "/data/image/upload"
 TIMEOUT = (5, 30)  # (bağlantı, okuma) saniye
 MAX_BATCH_LEN = 255
+MAX_ERROR_DETAIL_LEN = 300
+
+_JPEG_SIGNATURE = b"\xff\xd8\xff"
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 class UploadError(Exception):
@@ -20,15 +23,15 @@ class UploadError(Exception):
 
 
 class ConfigError(UploadError):
-    pass
+    """Yapılandırma hatası (yerel)."""
 
 
 class InvalidImageError(UploadError):
-    pass
+    """Görüntü verisi geçersiz (yerel; API'ye istek gönderilmeden önce)."""
 
 
 class ApiError(UploadError):
-    pass
+    """API'den dönen veya API iletişimindeki hata."""
 
 
 @dataclass
@@ -47,9 +50,7 @@ def normalize_batch_name(value):
         return None
 
     if len(name) > MAX_BATCH_LEN:
-        raise ConfigError(
-            f"Batch adı {MAX_BATCH_LEN} karakteri aşamaz."
-        )
+        raise ConfigError(f"Batch adı {MAX_BATCH_LEN} karakteri aşamaz.")
 
     return name
 
@@ -84,35 +85,35 @@ def parse_dataset_id(value):
         return dataset_id
 
     except (TypeError, ValueError, json.JSONDecodeError) as e:
-        raise ConfigError(
-            f"Geçersiz dataset id: {original_value!r}"
-        ) from e
+        raise ConfigError(f"Geçersiz dataset id: {original_value!r}") from e
 
 
-def normalize_content_type(content_type):
-    if not isinstance(content_type, str):
-        raise InvalidImageError(
-            f"Geçersiz görüntü türü: {content_type!r}"
-        )
+def detect_content_type(data):
+    """Görüntü türünü dosya imzasından belirler; dışarıdan gelen etikete güvenmez."""
+    if data.startswith(_JPEG_SIGNATURE):
+        return "image/jpeg"
+    if data.startswith(_PNG_SIGNATURE):
+        return "image/png"
+    raise InvalidImageError(
+        "Görüntü verisi JPEG veya PNG değil (dosya imzası eşleşmiyor)."
+    )
 
-    value = content_type.strip().lower().split(";")[0].strip()
 
-    aliases = {
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "image/jpg": "image/jpeg",
-        "image/pjpeg": "image/jpeg",
-        "png": "image/png",
-    }
+def _extract_error_detail(resp):
+    """API hata yanıtından kısa bir açıklama çıkarır; bulunamazsa boş string."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
 
-    value = aliases.get(value, value)
+    if not isinstance(body, dict):
+        return ""
 
-    if value not in ("image/jpeg", "image/png"):
-        raise InvalidImageError(
-            f"Desteklenmeyen görüntü türü: {content_type!r}"
-        )
-
-    return value
+    for key in ("message", "error", "detail"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:MAX_ERROR_DETAIL_LEN]
+    return ""
 
 
 def upload_image(
@@ -122,17 +123,18 @@ def upload_image(
     workspace_id,
     dataset_id,
     image_bytes,
-    content_type,
+    content_type=None,  # geriye dönük uyumluluk için; yok sayılır, tür imzadan belirlenir
     batch_name=None,
     timeout=TIMEOUT,
 ):
+    # --- Yerel doğrulamalar (API'ye istek gitmez) ---
     if not token:
         raise ConfigError("Erişim token'ı bulunamadı.")
 
-    content_type = normalize_content_type(content_type)
-
     if not isinstance(image_bytes, bytes) or not image_bytes:
         raise InvalidImageError("Görüntü verisi boş veya geçersiz.")
+
+    detected_type = detect_content_type(image_bytes)
 
     if not isinstance(dataset_id, int) or isinstance(dataset_id, bool):
         dataset_id = parse_dataset_id(dataset_id)
@@ -142,76 +144,57 @@ def upload_image(
 
     batch_name = normalize_batch_name(batch_name)
 
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
-
+    headers = {"Authorization": f"Bearer {token}"}  # token asla loglanmaz
     if workspace_id:
         headers["X-Workspace-Id"] = str(workspace_id)
 
-    ext = "png" if content_type == "image/png" else "jpg"
-
-    data = {
-        "id_dataset": str(dataset_id)
-    }
-
+    ext = "png" if detected_type == "image/png" else "jpg"
+    data = {"id_dataset": str(dataset_id)}
     if batch_name:
         data["batch_name"] = batch_name
 
+    # --- API isteği ---
     try:
         resp = requests.post(
             base_url.rstrip("/") + UPLOAD_PATH,
             headers=headers,
             data=data,
-            files={
-                "file": (
-                    f"frame.{ext}",
-                    image_bytes,
-                    content_type,
-                )
-            },
+            files={"file": (f"frame.{ext}", image_bytes, detected_type)},
             timeout=timeout,
         )
-
     except requests.Timeout as e:
-        raise ApiError(
-            "API isteği zaman aşımına uğradı."
-        ) from e
-
+        raise ApiError("API isteği zaman aşımına uğradı.") from e
     except requests.ConnectionError as e:
-        raise ApiError(
-            "API'ye bağlanılamadı."
-        ) from e
-
+        raise ApiError("API'ye bağlanılamadı.") from e
     except requests.RequestException as e:
-        raise ApiError(
-            f"İstek hatası: {type(e).__name__}"
-        ) from e
+        raise ApiError(f"İstek hatası: {type(e).__name__}") from e
 
+    # --- HTTP durum kodları ---
     sc = resp.status_code
 
     if sc == 401:
-        raise ApiError("Kimlik doğrulama hatası (401).")
-
+        raise ApiError("Kimlik doğrulama hatası (HTTP 401).")
     if sc == 403:
-        raise ApiError("Yetki hatası (403).")
-
-    if sc in (400, 404, 422):
-        try:
-            body = resp.json()
-            message = body.get("message", "")
-        except (ValueError, AttributeError):
-            message = ""
-
-        detail = f": {message}" if message else ""
-
+        raise ApiError("Yetki hatası (HTTP 403).")
+    if sc == 400:
+        detail = _extract_error_detail(resp)
+        raise ApiError(f"Geçersiz istek (HTTP 400){': ' + detail if detail else ''}")
+    if sc == 404:
+        detail = _extract_error_detail(resp)
         raise ApiError(
-            f"Geçersiz istek/dataset/görüntü ({sc}){detail}"
+            f"Dataset veya kayıt bulunamadı (HTTP 404){': ' + detail if detail else ''}"
         )
-
+    if sc == 422:
+        detail = _extract_error_detail(resp)
+        raise ApiError(
+            f"Görüntü biçimi desteklenmiyor veya dosya kaydedilemedi (HTTP 422)"
+            f"{': ' + detail if detail else ''}"
+        )
     if sc >= 400:
-        raise ApiError(f"API hatası ({sc}).")
+        detail = _extract_error_detail(resp)
+        raise ApiError(f"API hatası (HTTP {sc}){': ' + detail if detail else ''}")
 
+    # --- Başarılı yanıt (200: zaten mevcut olabilir, 201: eklendi) ---
     try:
         body = resp.json()
     except ValueError as e:
@@ -221,16 +204,13 @@ def upload_image(
         raise ApiError("Beklenmeyen API yanıtı.")
 
     if body.get("success") is False:
-        raise ApiError("API işlemi başarısız oldu.")
+        detail = _extract_error_detail(resp)
+        raise ApiError(f"API işlemi başarısız oldu{': ' + detail if detail else '.'}")
 
     bn = body.get("batch_name")
 
     return UploadResult(
-        batch_name=(
-            bn.strip()
-            if isinstance(bn, str) and bn.strip()
-            else None
-        ),
+        batch_name=bn.strip() if isinstance(bn, str) and bn.strip() else None,
         batch_created=bool(body.get("batch_created", False)),
         skipped=bool(body.get("skipped", False)),
     )
