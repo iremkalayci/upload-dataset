@@ -34,8 +34,6 @@ class OutputImage(Output):
 
 
 class ConfigDataset(Config):
-    """Select a dataset from the current workspace."""
-
     name: Literal["configDataset"] = "configDataset"
     value: str
     type: Literal["string"] = "string"
@@ -49,9 +47,26 @@ class ConfigDataset(Config):
         }
 
 
-class ConfigFrameInterval(Config):
-    """Save one frame for every N incoming frames."""
+class ConfigBatchName(Config):
+    """Name of the batch to which images will be uploaded."""
 
+    name: Literal["BatchName"] = "BatchName"
+    value: str = ""
+    type: Literal["string"] = "string"
+    field: Literal["textInput"] = "textInput"
+    placeHolder: Literal["e.g. batch00"] = "e.g. batch00"
+
+    class Config:
+        title = "Batch Name"
+        json_schema_extra = {
+            "shortDescription": (
+                "Enter an existing batch name or a new batch name. "
+                "Leave empty to create a batch automatically."
+            )
+        }
+
+
+class ConfigFrameInterval(Config):
     name: Literal["FrameInterval"] = "FrameInterval"
     value: int = Field(default=5, ge=1)
     type: Literal["number"] = "number"
@@ -71,6 +86,7 @@ class UploadDatasetInputs(Inputs):
 
 class UploadDatasetConfigs(Configs):
     dataset: ConfigDataset
+    batchName: ConfigBatchName
     frameInterval: ConfigFrameInterval
 
 
@@ -83,9 +99,7 @@ class UploadDatasetRequest(Request):
     configs: UploadDatasetConfigs
 
     class Config:
-        json_schema_extra = {
-            "target": "configs"
-        }
+        json_schema_extra = {"target": "configs"}
 
 
 class UploadDatasetResponse(Response):
@@ -93,10 +107,6 @@ class UploadDatasetResponse(Response):
 
 
 class UploadDatasetExecutor(Config):
-    """
-    Select and prepare video frames for dataset upload.
-    """
-
     name: Literal["UploadDataset"] = "UploadDataset"
     value: Union[UploadDatasetRequest, UploadDatasetResponse]
     type: Literal["object"] = "object"
@@ -104,11 +114,7 @@ class UploadDatasetExecutor(Config):
 
     class Config:
         title = "Upload Dataset"
-        json_schema_extra = {
-            "target": {
-                "value": 0
-            }
-        }
+        json_schema_extra = {"target": {"value": 0}}
 
 
 class ConfigExecutor(Config):
@@ -119,9 +125,7 @@ class ConfigExecutor(Config):
 
     class Config:
         title = "Task"
-        json_schema_extra = {
-            "target": "value"
-        }
+        json_schema_extra = {"target": "value"}
 
 
 class PackageConfigs(Configs):
