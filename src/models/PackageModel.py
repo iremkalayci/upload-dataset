@@ -17,7 +17,7 @@ from sdks.novavision.src.base.model import (
 
 class InputImage(Input):
     name: Literal["inputImage"] = "inputImage"
-    value: str
+    value: dict
     type: Literal["object"] = "object"
 
     class Config:
@@ -26,7 +26,7 @@ class InputImage(Input):
 
 class OutputImage(Output):
     name: Literal["outputImage"] = "outputImage"
-    value: str
+    value: dict
     type: Literal["object"] = "object"
 
     class Config:
