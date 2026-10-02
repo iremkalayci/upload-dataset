@@ -1,7 +1,8 @@
 """
-Upload Dataset: seçilen kareleri NovaVision dataset'ine yükler.
+Upload Dataset: VideoFeed karelerini seçip API'ye yükler.
 """
 
+import base64
 import logging
 import os
 import sys
@@ -10,66 +11,114 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
 from sdks.novavision.src.base.component import Component
 from sdks.novavision.src.helper.executor import Executor
+
 from components.UploadDataset.src.utils.response import build_response
 from components.UploadDataset.src.models.PackageModel import PackageModel
-from components.UploadDataset.src.utils import api_client
-from components.UploadDataset.src.utils.api_client import UploadError, get_credentials
-from components.UploadDataset.src.utils.image_utils import image_to_upload_bytes
-from components.UploadDataset.src.utils.sampler import FrameState, parse_interval
+from components.UploadDataset.src.utils.api_client import (
+    ApiClientError,
+    parse_dataset_id,
+    upload_image,
+)
+from components.UploadDataset.src.utils.sampler import (
+    FrameState,
+    parse_interval,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def extract_raw_bytes(payload):
+    """inputImage içinden re-encode yapmadan doğrudan baytları ayıklar."""
+    if isinstance(payload, (bytes, bytearray)):
+        return bytes(payload)
+
+    if isinstance(payload, dict):
+        for key in ("data", "bytes", "image", "frame", "buffer", "file"):
+            val = payload.get(key)
+            if isinstance(val, (bytes, bytearray)):
+                return bytes(val)
+            if isinstance(val, str) and val.strip():
+                try:
+                    raw_str = val.split(",", 1)[1] if "," in val else val
+                    return base64.b64decode(raw_str)
+                except Exception:
+                    continue
+
+    raise ApiClientError(
+        f"inputImage içinden geçerli bayt verisi çıkarılamadı. Veri tipi: {type(payload)}"
+    )
 
 
 class UploadDataset(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
-
         self.request.model = PackageModel(**self.request.data)
 
+        # Girdi verisi
         self.input_image = self.request.get_param("inputImage")
-        self.dataset = self.request.get_param("configDataset")
-        self.frame_interval = parse_interval(self.request.get_param("FrameInterval"))
-        self.batch_name_config = self.request.get_param("BatchName")
 
-        self.result = self.input_image  # çıktı: görüntü aynen geçirilir
-        self.upload_status = "not_run"  # not_run | skipped_frame | uploaded | duplicate | error
+        # ConfigDataset: Pydantic field 'dataset' veya config adı 'configDataset'
+        self.dataset = (
+            self.request.get_param("dataset")
+            or self.request.get_param("configDataset")
+        )
+
+        # ConfigFrameInterval: Pydantic field 'frameInterval' veya config adı 'FrameInterval'
+        self.frame_interval = parse_interval(
+            self.request.get_param("frameInterval")
+            or self.request.get_param("FrameInterval")
+        )
+
+        # ConfigBatchName: Pydantic field 'batchName' veya config adı 'BatchName'
+        self.batch_name_config = (
+            self.request.get_param("batchName")
+            or self.request.get_param("BatchName")
+            or ""
+        ).strip()
+
+        # Akışta giriş görüntüsü bozulmadan korunur (response.py ile tam uyum)
+        self.result = self.input_image
+        self.upload_status = "not_run"
 
     @staticmethod
     def bootstrap(config: dict) -> dict:
         return {}
 
-    def _process(self):
-        dataset_id = api_client.parse_dataset_id(self.dataset)
-        batch_cfg = api_client.normalize_batch_name(self.batch_name_config)
-
-        state = FrameState(self.redis_db.r, self.flowUID, self.matchedID)
-        if not state.should_select(self.frame_interval):
-            self.upload_status = "skipped_frame"
-            return
-
-        data, ctype = image_to_upload_bytes(self.input_image)
-        token, workspace, base_url = get_credentials(self.environment)
-        batch = batch_cfg or state.get_batch(dataset_id)
-
-        res = api_client.upload_image(
-            base_url=base_url, token=token, workspace_id=workspace,
-            dataset_id=dataset_id, image_bytes=data, content_type=ctype,
-            batch_name=batch,
-        )
-        # Kullanıcı batch adı vermediyse dönen adı sakla (duplicate'te de dönebilir).
-        if not batch_cfg and res.batch_name and res.batch_name != batch:
-            state.set_batch(dataset_id, res.batch_name)
-        self.upload_status = "duplicate" if res.skipped else "uploaded"
-
     def run(self):
         try:
-            self._process()
-        except UploadError as e:
+            state = FrameState(self.redis_db.r, self.flowUID, self.matchedID)
+
+            # Kare örnekleme aralığında değilse API çağrısı yapmadan akışı devam ettir
+            if not state.should_select(self.frame_interval):
+                self.upload_status = "skipped_frame"
+                return build_response(context=self)
+
+            dataset_id = parse_dataset_id(self.dataset)
+            image_bytes = extract_raw_bytes(self.input_image)
+
+            # Batch önceliği: Kullanıcı konfigürasyonu > Redis'teki mevcut batch > None (Yeni batch)
+            batch_name = self.batch_name_config or state.get_batch(dataset_id)
+
+            res = upload_image(
+                dataset_id=dataset_id,
+                image_bytes=image_bytes,
+                batch_name=batch_name,
+            )
+
+            # Kullanıcı batch adı girmemişse API'nin ürettiği ilk batch adını Redis'e yaz
+            api_batch = res.get("batch_name")[cite: 1]
+            if not self.batch_name_config and api_batch:
+                state.set_batch(dataset_id, api_batch)
+
+            self.upload_status = "duplicate" if res.get("skipped") else "uploaded"[cite: 1]
+
+        except ApiClientError as e:
             self.upload_status = "error"
-            logger.error("UploadDataset: %s", e)
-        except Exception:
+            logger.error("UploadDataset Doğrulama/API Hatası: %s", e)
+        except Exception as e:
             self.upload_status = "error"
-            logger.exception("UploadDataset: beklenmeyen hata")
+            logger.exception("UploadDataset Beklenmeyen Sistem Hatası: %s", e)
+
         return build_response(context=self)
 
 

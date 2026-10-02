@@ -1,17 +1,16 @@
-
+from typing import Literal, Optional, Union
 from pydantic import Field
-from typing import Optional, Union, Literal
 
 from sdks.novavision.src.base.model import (
-    Package,
-    Inputs,
-    Configs,
-    Outputs,
-    Response,
-    Request,
-    Output,
-    Input,
     Config,
+    Configs,
+    Input,
+    Inputs,
+    Output,
+    Outputs,
+    Package,
+    Request,
+    Response,
 )
 
 
@@ -34,17 +33,20 @@ class OutputImage(Output):
 
 
 class ConfigDataset(Config):
+    """Select a dataset from the current workspace."""
+
     name: Literal["configDataset"] = "configDataset"
     value: str
     type: Literal["string"] = "string"
     field: Literal["widget"] = "widget"
 
     class Config:
-        title = "Dataset"
         json_schema_extra = {
             "shortDescription": "Dataset Picker",
             "class": "\\novavision\\data\\widgets\\DatasetPicker",
+            "options": {"datasetTypes": ["object_detection"]},
         }
+        title = "Dataset"
 
 
 class ConfigBatchName(Config):
