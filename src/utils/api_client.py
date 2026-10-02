@@ -16,7 +16,7 @@ MAX_BATCH_LEN = 255
 
 
 class UploadError(Exception):
-    """Dataset upload akışında beklenen (raporlanabilir) hata."""
+    """Dataset upload akışında beklenen hata."""
 
 
 class ConfigError(UploadError):
@@ -73,6 +73,9 @@ def parse_dataset_id(value):
         if value is None or isinstance(value, bool):
             raise ValueError("Dataset ID bulunamadı.")
 
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError("Dataset ID tam sayı olmalı.")
+
         dataset_id = int(value)
 
         if dataset_id <= 0:
@@ -84,6 +87,32 @@ def parse_dataset_id(value):
         raise ConfigError(
             f"Geçersiz dataset id: {original_value!r}"
         ) from e
+
+
+def normalize_content_type(content_type):
+    if not isinstance(content_type, str):
+        raise InvalidImageError(
+            f"Geçersiz görüntü türü: {content_type!r}"
+        )
+
+    value = content_type.strip().lower().split(";")[0].strip()
+
+    aliases = {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "image/jpg": "image/jpeg",
+        "image/pjpeg": "image/jpeg",
+        "png": "image/png",
+    }
+
+    value = aliases.get(value, value)
+
+    if value not in ("image/jpeg", "image/png"):
+        raise InvalidImageError(
+            f"Desteklenmeyen görüntü türü: {content_type!r}"
+        )
+
+    return value
 
 
 def upload_image(
@@ -100,10 +129,18 @@ def upload_image(
     if not token:
         raise ConfigError("Erişim token'ı bulunamadı.")
 
-    if content_type not in ("image/jpeg", "image/png"):
-        raise InvalidImageError(
-            f"Desteklenmeyen görüntü türü: {content_type}"
-        )
+    content_type = normalize_content_type(content_type)
+
+    if not isinstance(image_bytes, bytes) or not image_bytes:
+        raise InvalidImageError("Görüntü verisi boş veya geçersiz.")
+
+    if not isinstance(dataset_id, int) or isinstance(dataset_id, bool):
+        dataset_id = parse_dataset_id(dataset_id)
+
+    if dataset_id <= 0:
+        raise ConfigError("Dataset ID pozitif olmalı.")
+
+    batch_name = normalize_batch_name(batch_name)
 
     headers = {
         "Authorization": f"Bearer {token}"
@@ -160,8 +197,16 @@ def upload_image(
         raise ApiError("Yetki hatası (403).")
 
     if sc in (400, 404, 422):
+        try:
+            body = resp.json()
+            message = body.get("message", "")
+        except (ValueError, AttributeError):
+            message = ""
+
+        detail = f": {message}" if message else ""
+
         raise ApiError(
-            f"Geçersiz istek/dataset/görüntü ({sc})."
+            f"Geçersiz istek/dataset/görüntü ({sc}){detail}"
         )
 
     if sc >= 400:
@@ -174,6 +219,9 @@ def upload_image(
 
     if not isinstance(body, dict):
         raise ApiError("Beklenmeyen API yanıtı.")
+
+    if body.get("success") is False:
+        raise ApiError("API işlemi başarısız oldu.")
 
     bn = body.get("batch_name")
 
