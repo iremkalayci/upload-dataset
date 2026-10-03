@@ -1,10 +1,8 @@
-
 """
-Upload Dataset: VideoFeed karelerini seçip API'ye yükler.
+Upload Dataset: VideoFeed'den gelen kareleri aralıkla seçip NovaVision dataset'ine yükler.
 """
 
-import base64
-import logging
+import hashlib
 import os
 import sys
 
@@ -12,186 +10,122 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
 from sdks.novavision.src.base.component import Component
 from sdks.novavision.src.helper.executor import Executor
-
+from sdks.novavision.src.media.image import Image
 from components.UploadDataset.src.utils.response import build_response
 from components.UploadDataset.src.models.PackageModel import PackageModel
-from components.UploadDataset.src.utils.api_client import (
-    ApiClientError,
-    parse_dataset_id,
-    upload_image,
-)
-from components.UploadDataset.src.utils.sampler import (
-    FrameState,
-    parse_interval,
-)
+from components.UploadDataset.src.utils import api_client
 
-logger = logging.getLogger(__name__)
+VERSION = "v3"
+TTL = 24 * 3600  # Redis durum anahtarlarının boşta kalma süresi
 
 
-def extract_raw_bytes(payload):
-    """NovaVision Image nesnesindeki Base64 verisini bytes'a çözer."""
+def log(msg):
+    print(f"[UploadDataset {VERSION}] {msg}", flush=True)
 
-    if isinstance(payload, (bytes, bytearray)):
-        image_bytes = bytes(payload)
 
-    elif isinstance(payload, dict):
-        current = payload
-        image_bytes = None
-
-        for _ in range(8):
-            if not isinstance(current, dict):
-                break
-
-            value = current.get("value")
-
-            if isinstance(value, (bytes, bytearray)):
-                image_bytes = bytes(value)
-                break
-
-            if isinstance(value, str):
-                encoded = value.strip()
-
-                if encoded.startswith("data:") and "," in encoded:
-                    encoded = encoded.split(",", 1)[1]
-
-                try:
-                    image_bytes = base64.b64decode(
-                        encoded,
-                        validate=True,
-                    )
-                except (ValueError, TypeError) as exc:
-                    raise ApiClientError(
-                        f"Base64 görüntü verisi çözülemedi: {exc}"
-                    ) from exc
-
-                break
-
-            if isinstance(value, dict):
-                current = value
-                continue
-
-            raise ApiClientError(
-                "Görüntü verisi bulunamadı. "
-                f"Mevcut alanlar: {list(current.keys())}"
-            )
-
-        if image_bytes is None:
-            raise ApiClientError(
-                "Görüntü verisi beklenen yapıda bulunamadı."
-            )
-    else:
-        raise ApiClientError(
-            f"Beklenmeyen inputImage tipi: {type(payload)}"
-        )
-
-    if not image_bytes:
-        raise ApiClientError("Görüntü verisi boş.")
-
-    if image_bytes.startswith(b"\xff\xd8\xff"):
-        return image_bytes
-
-    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-        return image_bytes
-
-    raise ApiClientError(
-        "Görüntü JPEG veya PNG biçiminde değil. "
-        f"İlk baytlar: {image_bytes[:8].hex()}"
-    )
+def first_image(value):
+    """Girişten tek bir Image sözlüğü döndürür (liste gelirse ilk eleman)."""
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
 
 
 class UploadDataset(Component):
-
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
+
         self.request.model = PackageModel(**self.request.data)
 
-        # Girdi verisi
         self.input_image = self.request.get_param("inputImage")
+        self.dataset = self.request.get_param("configDataset")
+        self.batch_name = str(self.request.get_param("BatchName") or "").strip()
+        try:
+            self.frame_interval = max(1, int(self.request.get_param("FrameInterval") or 5))
+        except (TypeError, ValueError):
+            self.frame_interval = 5
 
-        # Dataset Picker
-        self.dataset = (
-            self.request.get_param("dataset")
-            or self.request.get_param("configDataset")
-        )
-
-        # Kare örnekleme aralığı
-        self.frame_interval = parse_interval(
-            self.request.get_param("frameInterval")
-            or self.request.get_param("FrameInterval")
-        )
-
-        # Batch adı
-        self.batch_name_config = (
-            self.request.get_param("batchName")
-            or self.request.get_param("BatchName")
-            or ""
-        ).strip()
-
-        # Orijinal görüntüyü çıkışta koru.
-        self.result = self.input_image
-        self.upload_status = "not_run"
+        self.result = self.input_image  # çıktı: giriş görüntüsü aynen geçirilir
 
     @staticmethod
     def bootstrap(config: dict) -> dict:
         return {}
 
+    def _state_key(self):
+        """Redis anahtarı: akış + bileşen + video oturumu (video_path/source ve loop).
+
+        Video değişince ya da başa sarılınca sayaç ve batch sıfırlanır. Kaynak adresi
+        kimlik bilgisi içerebileceğinden (rtsp://user:pass@...) özetlenerek yazılır.
+        """
+        image = first_image(self.input_image)
+        meta = (image.get("metadata") if isinstance(image, dict) else None) or {}
+        raw = f"{meta.get('video_path') or meta.get('source') or ''}|{meta.get('loop', 0)}"
+        session = hashlib.md5(raw.encode()).hexdigest()[:12]
+        return f"UploadDataset:{self.flowUID}:{self.matchedID}:{session}"
+
+    def _upload_if_selected(self):
+        redis = self.redis_db.r
+        key = self._state_key()
+
+        # Sayaç Redis'te: SDK her kare için yeni örnek oluşturur.
+        # İlk kare seçilir, sonra her N. kare (N=5 için 1., 6., 11. ...).
+        n = redis.incr(key)
+        redis.expire(key, TTL)
+        if (n - 1) % self.frame_interval:
+            return
+
+        try:
+            dataset_id = api_client.parse_dataset_id(self.dataset)
+        except (TypeError, ValueError, KeyError) as e:
+            log(f"kare={n} YEREL HATA: dataset id çözülemedi "
+                f"({type(e).__name__}: {e}): {self.dataset!r}")
+            return
+
+        # Kare Redis'tedir (VideoFeed set_frame). get_frame verilen sözlüğü değiştirdiği için
+        # kopya verilir; böylece çıktıya geçen self.input_image bozulmaz.
+        source = first_image(self.input_image)
+        frame = Image.get_frame(img=dict(source), redis_db=self.redis_db) if isinstance(source, dict) else None
+        if frame is None:
+            log(f"kare={n} YEREL HATA: kare Redis'ten okunamadı "
+                f"(giriş tipi={type(source).__name__}, anahtarlar="
+                f"{list(source) if isinstance(source, dict) else None})")
+            return
+        try:
+            image = api_client.frame_to_jpeg(frame.value)
+        except Exception as e:
+            log(f"kare={n} YEREL HATA (JPEG): {type(e).__name__}: {e}")
+            return
+
+        token, workspace_id, base_url = api_client.get_credentials(self.environment)
+        if not token:
+            log(f"kare={n} YEREL HATA: NOVAVISION_ACCESS_TOKEN tanımlı değil.")
+            return
+
+        batch = self.batch_name or redis.get(key + ":batch")
+        if isinstance(batch, bytes):
+            batch = batch.decode()
+
+        log(f"kare={n} yükleniyor: dataset={dataset_id} adres={base_url} "
+            f"workspace={workspace_id or 'YOK'} batch={batch!r} boyut={len(image)}B")
+        status, body = api_client.upload_image(
+            base_url, token, workspace_id, dataset_id, image, batch
+        )
+
+        if status in (200, 201) and isinstance(body, dict):
+            skipped = bool(body.get("skipped"))
+            name = body.get("batch_name")
+            log(f"kare={n} HTTP {status} {'ATLANDI (zaten var)' if skipped else 'EKLENDI'} "
+                f"batch={name!r} yeni_batch={body.get('batch_created')}")
+            # Atlanan görselin batch'i eski bir batch olabilir; yalnızca yeni eklemede saklanır.
+            if not skipped and name and not self.batch_name:
+                redis.set(key + ":batch", name, ex=TTL)
+        else:
+            log(f"kare={n} HTTP {status} HATA: {str(body)[:300]}")
+
     def run(self):
         try:
-            state = FrameState(
-                self.redis_db.r,
-                self.flowUID,
-                self.matchedID,
-            )
-
-            # Kare seçilmediyse API'ye istek gönderme.
-            if not state.should_select(self.frame_interval):
-                self.upload_status = "skipped_frame"
-                return build_response(context=self)
-
-            # Dataset ID'sini çöz.
-            dataset_id = parse_dataset_id(self.dataset)
-
-            # Görüntünün Base64 verisini çöz.
-            image_bytes = extract_raw_bytes(self.input_image)
-
-            # Batch önceliği:
-            # Kullanıcı ayarı > Redis > Yeni batch
-            batch_name = (
-                self.batch_name_config
-                or state.get_batch(dataset_id)
-            )
-
-            # Görüntüyü Data API'ye yükle.
-            res = upload_image(
-                dataset_id=dataset_id,
-                image_bytes=image_bytes,
-                batch_name=batch_name,
-            )
-
-            # Otomatik oluşturulan batch adını sakla.
-            api_batch = res.get("batch_name")
-
-            if not self.batch_name_config and api_batch:
-                state.set_batch(dataset_id, api_batch)
-
-            self.upload_status = (
-                "duplicate" if res.get("skipped") else "uploaded"
-            )
-
-        except ApiClientError as e:
-            self.upload_status = "error"
-            logger.error(
-                "UploadDataset Doğrulama/API Hatası: %s",
-                e,
-            )
-
-        except Exception as e:
-            self.upload_status = "error"
-            logger.exception(
-                "UploadDataset Beklenmeyen Sistem Hatası: %s",
-                e,
-            )
-
+            self._upload_if_selected()
+        except Exception as e:  # tek karedeki hata akışı durdurmasın
+            log(f"HATA ({type(e).__name__}): {e}")
         return build_response(context=self)
 
 
