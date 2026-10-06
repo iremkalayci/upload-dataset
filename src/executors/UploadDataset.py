@@ -96,9 +96,9 @@ class UploadDataset(Component):
             return
 
         token, workspace_id, base_url = api_client.get_credentials(self.environment)
-        if not token:
-            log(f"kare={n} YEREL HATA: NOVAVISION_ACCESS_TOKEN tanımlı değil.")
-            return
+        #if not token:
+        #    log(f"kare={n} YEREL HATA: NOVAVISION_ACCESS_TOKEN tanımlı değil.")
+         #   return
 
         batch = self.batch_name or redis.get(key + ":batch")
         if isinstance(batch, bytes):
