@@ -15,8 +15,9 @@ from components.UploadDataset.src.utils.response import build_response
 from components.UploadDataset.src.models.PackageModel import PackageModel
 from components.UploadDataset.src.utils import api_client
 
-VERSION = "v3"
+VERSION = "v4"
 TTL = 24 * 3600  # Redis durum anahtarlarının boşta kalma süresi
+DIAG_FRAMES = 12  # tanı: ilk N gelen karenin özeti loglanır
 
 
 def log(msg):
@@ -50,14 +51,18 @@ class UploadDataset(Component):
     def bootstrap(config: dict) -> dict:
         return {}
 
+    def _frame_meta(self):
+        """VideoFeed'in kareyle birlikte gönderdiği metadata (yoksa boş sözlük)."""
+        image = first_image(self.input_image)
+        return (image.get("metadata") if isinstance(image, dict) else None) or {}
+
     def _state_key(self):
         """Redis anahtarı: akış + bileşen + video oturumu (video_path/source ve loop).
 
         Video değişince ya da başa sarılınca sayaç ve batch sıfırlanır. Kaynak adresi
         kimlik bilgisi içerebileceğinden (rtsp://user:pass@...) özetlenerek yazılır.
         """
-        image = first_image(self.input_image)
-        meta = (image.get("metadata") if isinstance(image, dict) else None) or {}
+        meta = self._frame_meta()
         raw = f"{meta.get('video_path') or meta.get('source') or ''}|{meta.get('loop', 0)}"
         session = hashlib.md5(raw.encode()).hexdigest()[:12]
         return f"UploadDataset:{self.flowUID}:{self.matchedID}:{session}"
@@ -65,11 +70,16 @@ class UploadDataset(Component):
     def _upload_if_selected(self):
         redis = self.redis_db.r
         key = self._state_key()
+        meta = self._frame_meta()
 
         # Sayaç Redis'te: SDK her kare için yeni örnek oluşturur.
         # İlk kare seçilir, sonra her N. kare (N=5 için 1., 6., 11. ...).
         n = redis.incr(key)
         redis.expire(key, TTL)
+        if n <= DIAG_FRAMES:
+            log(f"kare={n} geldi: seçilecek={(n - 1) % self.frame_interval == 0} "
+                f"aralık={self.frame_interval} video_kare={meta.get('frame_index')} "
+                f"debug={self.debug} anahtar={key}")
         if (n - 1) % self.frame_interval:
             return
 
@@ -96,15 +106,16 @@ class UploadDataset(Component):
             return
 
         token, workspace_id, base_url = api_client.get_credentials(self.environment)
-        #if not token:
-        #    log(f"kare={n} YEREL HATA: NOVAVISION_ACCESS_TOKEN tanımlı değil.")
-         #   return
+        if not token:
+            log(f"kare={n} YEREL HATA: DEVICE_ACCESS_TOKEN tanımlı değil.")
+            return
 
         batch = self.batch_name or redis.get(key + ":batch")
         if isinstance(batch, bytes):
             batch = batch.decode()
 
-        log(f"kare={n} yükleniyor: dataset={dataset_id} adres={base_url} "
+        log(f"kare={n} yükleniyor: video_kare={meta.get('frame_index')} "
+            f"md5={hashlib.md5(image).hexdigest()[:8]} dataset={dataset_id} adres={base_url} "
             f"workspace={workspace_id or 'YOK'} batch={batch!r} boyut={len(image)}B")
         status, body = api_client.upload_image(
             base_url, token, workspace_id, dataset_id, image, batch
